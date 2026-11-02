@@ -1,0 +1,935 @@
+#include "minimix/virtual_camera.h"
+
+#include <windows.h>
+#include <mfapi.h>
+#include <mferror.h>
+#include <mfidl.h>
+#include <ks.h>
+#include <ksmedia.h>
+#include <ksproxy.h>
+
+#include <filesystem>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+using GetClassObject = HRESULT(__stdcall*)(REFCLSID, REFIID, LPVOID*);
+using ClearFrame = int(__cdecl*)(std::uint8_t);
+using PublishBgra = int(__cdecl*)(const std::uint8_t*, std::uint32_t, std::uint32_t,
+                                  std::uint32_t);
+using SetWorkerPaused = HRESULT(__stdcall*)(BOOL);
+using WaitForWorker = DWORD(__stdcall*)(DWORD);
+using WaitForRequestReleases = DWORD(__stdcall*)(std::uint64_t, DWORD);
+using GetRequestCounters = HRESULT(__stdcall*)(
+    std::uint64_t*, std::uint64_t*, std::uint64_t*);
+using TestFailureHook = void(__stdcall*)();
+
+class CountedToken final : public IUnknown {
+ public:
+  HRESULT Initialize() {
+    return CoCreateFreeThreadedMarshaler(static_cast<IUnknown*>(this), &marshaler_);
+  }
+  ~CountedToken() {
+    if (marshaler_) marshaler_->Release();
+  }
+  STDMETHODIMP QueryInterface(REFIID iid, void** object) override {
+    if (!object) return E_POINTER;
+    *object = nullptr;
+    if (iid == IID_IUnknown) {
+      *object = static_cast<IUnknown*>(this);
+      AddRef();
+      return S_OK;
+    }
+    if (iid == IID_IMarshal && marshaler_) {
+      return marshaler_->QueryInterface(iid, object);
+    }
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++references_; }
+  STDMETHODIMP_(ULONG) Release() override { return --references_; }
+  ULONG reference_count() const { return references_.load(); }
+
+ private:
+  std::atomic<ULONG> references_{1};
+  IUnknown* marshaler_ = nullptr;
+};
+
+template <typename Interface>
+bool supports(IUnknown* object, const char* name) {
+  Interface* result = nullptr;
+  const HRESULT hr = object->QueryInterface(__uuidof(Interface), reinterpret_cast<void**>(&result));
+  if (FAILED(hr)) {
+    std::cerr << name << " QueryInterface failed: 0x" << std::hex
+              << static_cast<unsigned long>(hr) << "\n";
+    return false;
+  }
+  result->Release();
+  return true;
+}
+
+bool expect_event_value_type(IMFMediaEventGenerator* generator,
+                             MediaEventType expected, VARTYPE value_type,
+                             const char* description, LONGLONG* i8_value = nullptr) {
+  IMFMediaEvent* event = nullptr;
+  HRESULT hr = generator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+  MediaEventType actual{};
+  if (SUCCEEDED(hr)) hr = event->GetType(&actual);
+  PROPVARIANT value;
+  PropVariantInit(&value);
+  if (SUCCEEDED(hr) && actual == expected) hr = event->GetValue(&value);
+  const bool matches = SUCCEEDED(hr) && actual == expected &&
+      value.vt == value_type &&
+      (!i8_value || (value_type == VT_I8 &&
+                     ((*i8_value = value.hVal.QuadPart) > 0)));
+  if (!matches) {
+    std::cerr << description << " event value mismatch (HRESULT 0x" << std::hex
+              << static_cast<unsigned long>(hr) << ", type "
+              << static_cast<unsigned long>(actual) << ", value type "
+              << static_cast<unsigned long>(value.vt) << ").\n";
+  }
+  PropVariantClear(&value);
+  if (event) event->Release();
+  return matches;
+}
+
+bool expect_no_event(IMFMediaEventGenerator* generator, const char* description) {
+  IMFMediaEvent* event = nullptr;
+  const HRESULT hr = generator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+  if (event) event->Release();
+  if (hr == MF_E_NO_EVENTS_AVAILABLE) return true;
+  std::cerr << description << " unexpectedly queued an event (HRESULT 0x"
+            << std::hex << static_cast<unsigned long>(hr) << ").\n";
+  return false;
+}
+
+bool expect_stream_announcement(IMFMediaEventGenerator* generator,
+                                MediaEventType expected, IUnknown* expected_stream,
+                                const char* description) {
+  IMFMediaEvent* event = nullptr;
+  HRESULT hr = generator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+  MediaEventType actual{};
+  if (SUCCEEDED(hr)) hr = event->GetType(&actual);
+  PROPVARIANT value;
+  PropVariantInit(&value);
+  if (SUCCEEDED(hr) && actual == expected) hr = event->GetValue(&value);
+  IUnknown* actual_stream = nullptr;
+  if (SUCCEEDED(hr) && value.vt == VT_UNKNOWN) {
+    hr = value.punkVal->QueryInterface(
+        IID_IUnknown, reinterpret_cast<void**>(&actual_stream));
+  } else if (SUCCEEDED(hr)) {
+    hr = E_NOINTERFACE;
+  }
+  IUnknown* expected_identity = nullptr;
+  if (SUCCEEDED(hr)) {
+    hr = expected_stream->QueryInterface(
+        IID_IUnknown, reinterpret_cast<void**>(&expected_identity));
+  }
+  const bool matches = SUCCEEDED(hr) && actual == expected &&
+      actual_stream == expected_identity;
+  if (!matches) {
+    std::cerr << description << " stream-announcement mismatch (HRESULT 0x"
+              << std::hex << static_cast<unsigned long>(hr) << ", type "
+              << static_cast<unsigned long>(actual) << ").\n";
+  }
+  if (expected_identity) expected_identity->Release();
+  if (actual_stream) actual_stream->Release();
+  PropVariantClear(&value);
+  if (event) event->Release();
+  return matches;
+}
+
+bool request_sample_while_worker_paused(
+    IMFMediaStream* stream, IUnknown* token, SetWorkerPaused set_worker_paused,
+    WaitForWorker wait_for_worker, HRESULT* request_result) {
+  IStream* stream_packet = nullptr;
+  HRESULT hr = CoMarshalInterThreadInterfaceInStream(
+      __uuidof(IMFMediaStream), stream, &stream_packet);
+  if (FAILED(hr)) return false;
+  HANDLE returned = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!returned) {
+    CoReleaseMarshalData(stream_packet);
+    stream_packet->Release();
+    return false;
+  }
+  std::atomic<HRESULT> call_result{E_PENDING};
+  bool stream_packet_consumed = false;
+  std::thread caller([stream_packet, token, returned, &call_result,
+                      &stream_packet_consumed] {
+    const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IMFMediaStream* caller_stream = nullptr;
+    HRESULT call_hr = apartment;
+    if (SUCCEEDED(apartment)) {
+      stream_packet_consumed = true;
+      call_hr = CoGetInterfaceAndReleaseStream(
+          stream_packet, __uuidof(IMFMediaStream),
+          reinterpret_cast<void**>(&caller_stream));
+    }
+    if (SUCCEEDED(call_hr)) call_hr = caller_stream->RequestSample(token);
+    if (caller_stream) caller_stream->Release();
+    if (SUCCEEDED(apartment)) CoUninitialize();
+    call_result.store(call_hr, std::memory_order_release);
+    SetEvent(returned);
+  });
+  const DWORD returned_while_blocked = WaitForSingleObject(returned, 5000);
+  const DWORD worker_blocked = wait_for_worker(5000);
+  const bool completed_before_release =
+      returned_while_blocked == WAIT_OBJECT_0 &&
+      worker_blocked == WAIT_OBJECT_0;
+  set_worker_paused(FALSE);
+  caller.join();
+  if (!stream_packet_consumed) {
+    CoReleaseMarshalData(stream_packet);
+    stream_packet->Release();
+  }
+  CloseHandle(returned);
+  if (request_result) *request_result = call_result.load(std::memory_order_acquire);
+  return completed_before_release;
+}
+
+bool expect_color_bars_sample(IMFMediaStream* stream, IUnknown* expected_token,
+                              LONGLONG* timestamp, LONGLONG* duration) {
+  static constexpr std::array<std::array<std::uint8_t, 3>, 7> expected_bgr{{
+      {{191, 191, 191}}, {{0, 191, 191}}, {{191, 191, 0}}, {{0, 191, 0}},
+      {{191, 0, 191}}, {{0, 0, 191}}, {{191, 0, 0}},
+  }};
+  IMFMediaEvent* event = nullptr;
+  HRESULT hr = S_OK;
+  bool found_sample = false;
+  for (int attempt = 0; attempt < 200 && !found_sample; ++attempt) {
+    hr = stream->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+    if (hr == MF_E_NO_EVENTS_AVAILABLE) {
+      Sleep(10);
+      continue;
+    }
+    if (FAILED(hr)) break;
+    MediaEventType event_type{};
+    hr = event->GetType(&event_type);
+    if (FAILED(hr) || event_type == MEError) break;
+    found_sample = event_type == MEMediaSample;
+    if (!found_sample) {
+      event->Release();
+      event = nullptr;
+    }
+  }
+  if (FAILED(hr) || !found_sample) {
+    if (event) event->Release();
+    std::cerr << "A resumed RequestSample did not produce MEMediaSample.\n";
+    return false;
+  }
+
+  PROPVARIANT value;
+  PropVariantInit(&value);
+  hr = event->GetValue(&value);
+  event->Release();
+  IMFSample* sample = nullptr;
+  if (SUCCEEDED(hr) && value.vt == VT_UNKNOWN) {
+    hr = value.punkVal->QueryInterface(__uuidof(IMFSample), reinterpret_cast<void**>(&sample));
+  } else if (SUCCEEDED(hr)) {
+    hr = E_NOINTERFACE;
+  }
+  PropVariantClear(&value);
+
+  IUnknown* sample_token = nullptr;
+  if (SUCCEEDED(hr) && sample) {
+    hr = sample->GetUnknown(MFSampleExtension_Token, &sample_token);
+  }
+  if (SUCCEEDED(hr) && sample_token != expected_token) hr = E_UNEXPECTED;
+  if (SUCCEEDED(hr) && timestamp) hr = sample->GetSampleTime(timestamp);
+  if (SUCCEEDED(hr) && duration) hr = sample->GetSampleDuration(duration);
+
+  IMFMediaBuffer* buffer = nullptr;
+  if (SUCCEEDED(hr) && sample) hr = sample->ConvertToContiguousBuffer(&buffer);
+  BYTE* pixels = nullptr;
+  DWORD max_length = 0, current_length = 0;
+  if (SUCCEEDED(hr) && buffer) hr = buffer->Lock(&pixels, &max_length, &current_length);
+  bool matches = SUCCEEDED(hr) && current_length >= 1280u * 720u * 4u;
+  if (matches) {
+    for (std::size_t index = 0; index < expected_bgr.size() && matches; ++index) {
+      const auto x = static_cast<std::uint32_t>((2 * index + 1) * 1280 /
+                                                (2 * expected_bgr.size()));
+      const auto offset = static_cast<std::size_t>(360) * 1280 * 4 + x * 4;
+      for (std::size_t channel = 0; channel < expected_bgr[index].size(); ++channel) {
+        if (pixels[offset + channel] != expected_bgr[index][channel]) matches = false;
+      }
+    }
+  }
+  if (pixels && buffer) buffer->Unlock();
+  if (buffer) buffer->Release();
+  if (sample_token) sample_token->Release();
+  if (sample) sample->Release();
+  if (!matches) std::cerr << "Resumed sample did not contain the expected color bars.\n";
+  return matches;
+}
+
+}  // namespace
+
+int main() {
+  const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (FAILED(apartment)) {
+    std::cerr << "CoInitializeEx failed: 0x" << std::hex
+              << static_cast<unsigned long>(apartment) << "\n";
+    return 1;
+  }
+
+  HRESULT result = MFStartup(MF_VERSION);
+  if (FAILED(result)) {
+    std::cerr << "MFStartup failed: 0x" << std::hex
+              << static_cast<unsigned long>(result) << "\n";
+    CoUninitialize();
+    return 1;
+  }
+
+  std::wstring executable_path(32768, L'\0');
+  const DWORD path_length = GetModuleFileNameW(
+      nullptr, executable_path.data(), static_cast<DWORD>(executable_path.size()));
+  HMODULE module = nullptr;
+  IClassFactory* factory = nullptr;
+  IMFActivate* activate = nullptr;
+  IMFMediaSource* source = nullptr;
+  IMFMediaStream* stream = nullptr;
+  IMFMediaStream2* stream2 = nullptr;
+  IMFPresentationDescriptor* presentation = nullptr;
+#ifdef MINIMIX_VCAM_TEST_HOOKS
+  SetWorkerPaused set_worker_paused = nullptr;
+  WaitForWorker wait_for_worker = nullptr;
+  WaitForRequestReleases wait_for_request_releases = nullptr;
+  GetRequestCounters get_request_counters = nullptr;
+  TestFailureHook fail_next_submission = nullptr;
+  TestFailureHook fail_next_registration = nullptr;
+  TestFailureHook fail_next_retrieval = nullptr;
+#endif
+  bool passed = false;
+
+  do {
+    if (!path_length || path_length >= executable_path.size()) {
+      std::cerr << "Could not locate activation test executable.\n";
+      break;
+    }
+    executable_path.resize(path_length);
+    const auto dll_path = std::filesystem::path(executable_path).parent_path() / L"MiniMixVcam.dll";
+    module = LoadLibraryW(dll_path.c_str());
+    if (!module) {
+      std::cerr << "Could not load MiniMixVcam.dll (Windows error " << GetLastError() << ").\n";
+      break;
+    }
+
+    const auto get_class_object = reinterpret_cast<GetClassObject>(
+        GetProcAddress(module, "DllGetClassObject"));
+    if (!get_class_object) {
+      std::cerr << "DllGetClassObject export is missing.\n";
+      break;
+    }
+#ifdef MINIMIX_VCAM_TEST_HOOKS
+    set_worker_paused = reinterpret_cast<SetWorkerPaused>(
+        GetProcAddress(module, "minimix_vcam_test_set_worker_paused"));
+    wait_for_worker = reinterpret_cast<WaitForWorker>(
+        GetProcAddress(module, "minimix_vcam_test_wait_for_worker"));
+    wait_for_request_releases = reinterpret_cast<WaitForRequestReleases>(
+        GetProcAddress(module, "minimix_vcam_test_wait_for_request_releases"));
+    get_request_counters = reinterpret_cast<GetRequestCounters>(
+        GetProcAddress(module, "minimix_vcam_test_get_request_counters"));
+    fail_next_submission = reinterpret_cast<TestFailureHook>(
+        GetProcAddress(module, "minimix_vcam_test_fail_next_submission"));
+    fail_next_registration = reinterpret_cast<TestFailureHook>(
+        GetProcAddress(module, "minimix_vcam_test_fail_next_registration"));
+    fail_next_retrieval = reinterpret_cast<TestFailureHook>(
+        GetProcAddress(module, "minimix_vcam_test_fail_next_retrieval"));
+    if (!set_worker_paused || !wait_for_worker || !wait_for_request_releases ||
+        !get_request_counters || !fail_next_submission ||
+        !fail_next_registration || !fail_next_retrieval) {
+      std::cerr << "A deterministic sample-request test hook is missing.\n";
+      break;
+    }
+#endif
+#ifdef MINIMIX_VCAM_FORCE_COLOR_BARS_DIAGNOSTIC
+    const auto publish_bgra = reinterpret_cast<PublishBgra>(
+        GetProcAddress(module, "minimix_vcam_publish_bgra"));
+    std::vector<std::uint8_t> black_frame(1280u * 720u * 4u, 0);
+    if (!publish_bgra || publish_bgra(black_frame.data(), 1280, 720, 1280u * 4u) != 0) {
+      std::cerr << "Could not seed the diagnostic test with a black shared-memory frame.\n";
+      break;
+    }
+#else
+    const auto clear_frame = reinterpret_cast<ClearFrame>(
+        GetProcAddress(module, "minimix_vcam_clear"));
+    if (!clear_frame || clear_frame(1) != 0) {
+      std::cerr << "Could not seed the virtual-camera ring with color bars.\n";
+      break;
+    }
+#endif
+    result = get_class_object(
+        minimix::vcam::kVirtualCameraSourceClsids[0], IID_IClassFactory,
+        reinterpret_cast<void**>(&factory));
+    if (FAILED(result)) {
+      std::cerr << "DllGetClassObject failed: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+
+    result = factory->CreateInstance(nullptr, IID_IMFActivate, reinterpret_cast<void**>(&activate));
+    if (FAILED(result)) {
+      std::cerr << "COM class did not provide IMFActivate: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+    result = activate->ActivateObject(IID_IMFMediaSource, reinterpret_cast<void**>(&source));
+    if (FAILED(result)) {
+      std::cerr << "IMFActivate::ActivateObject failed: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+
+    if (!supports<IMFMediaEventGenerator>(source, "IMFMediaEventGenerator") ||
+        !supports<IMFMediaSource>(source, "IMFMediaSource") ||
+        !supports<IMFMediaSourceEx>(source, "IMFMediaSourceEx") ||
+        !supports<IMFGetService>(source, "IMFGetService") ||
+        !supports<IKsControl>(source, "IKsControl") ||
+        !supports<IMFSampleAllocatorControl>(source, "IMFSampleAllocatorControl")) {
+      break;
+    }
+
+    IMFMediaSourceEx* source_ex = nullptr;
+    result = source->QueryInterface(__uuidof(IMFMediaSourceEx), reinterpret_cast<void**>(&source_ex));
+    if (FAILED(result)) break;
+    IMFAttributes* stream_attributes = nullptr;
+    result = source_ex->GetStreamAttributes(0, &stream_attributes);
+    source_ex->Release();
+    if (FAILED(result)) {
+      std::cerr << "GetStreamAttributes failed: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+    GUID stream_category = GUID_NULL;
+    result = stream_attributes->GetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, &stream_category);
+    stream_attributes->Release();
+    if (FAILED(result) || stream_category != PINNAME_VIDEO_CAPTURE) {
+      std::cerr << "Video stream category attribute is missing or incorrect.\n";
+      break;
+    }
+
+    result = source->CreatePresentationDescriptor(&presentation);
+    if (FAILED(result)) {
+      std::cerr << "CreatePresentationDescriptor failed: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+    IMFStreamDescriptor* stream_descriptor = nullptr;
+    BOOL stream_selected = FALSE;
+    result = presentation->GetStreamDescriptorByIndex(0, &stream_selected, &stream_descriptor);
+    if (FAILED(result)) {
+      std::cerr << "GetStreamDescriptorByIndex failed: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+    stream_category = GUID_NULL;
+    result = stream_descriptor->GetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, &stream_category);
+    if (FAILED(result) || stream_category != PINNAME_VIDEO_CAPTURE) {
+      stream_descriptor->Release();
+      std::cerr << "Stream descriptor category attribute is missing or incorrect.\n";
+      break;
+    }
+    result = presentation->SelectStream(0);
+    if (FAILED(result)) {
+      stream_descriptor->Release();
+      std::cerr << "Could not select the initial test stream.\n";
+      break;
+    }
+
+    IMFMediaTypeHandler* media_type_handler = nullptr;
+    result = stream_descriptor->GetMediaTypeHandler(&media_type_handler);
+    if (FAILED(result)) {
+      stream_descriptor->Release();
+      std::cerr << "GetMediaTypeHandler failed: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+    DWORD media_type_count = 0;
+    result = media_type_handler->GetMediaTypeCount(&media_type_count);
+    IMFMediaType* available_type = nullptr;
+    if (SUCCEEDED(result) && media_type_count >= 1) {
+      result = media_type_handler->GetMediaTypeByIndex(0, &available_type);
+    } else if (SUCCEEDED(result)) {
+      result = MF_E_NO_MORE_TYPES;
+    }
+    IMFMediaType* current_type = nullptr;
+    if (SUCCEEDED(result)) result = media_type_handler->GetCurrentMediaType(&current_type);
+    if (SUCCEEDED(result)) result = media_type_handler->SetCurrentMediaType(available_type);
+    if (current_type) current_type->Release();
+    if (available_type) available_type->Release();
+    media_type_handler->Release();
+    stream_descriptor->Release();
+    if (FAILED(result)) {
+      std::cerr << "Media-type handshake failed: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+
+    GUID current_time = GUID_NULL;
+    PROPVARIANT start_position;
+    PropVariantInit(&start_position);
+    result = source->Start(presentation, &current_time, &start_position);
+    if (FAILED(result)) {
+      std::cerr << "First IMFMediaSource::Start failed: 0x" << std::hex
+                << static_cast<unsigned long>(result) << "\n";
+      break;
+    }
+    IMFMediaEvent* new_stream_event = nullptr;
+    result = source->GetEvent(MF_EVENT_FLAG_NO_WAIT, &new_stream_event);
+    MediaEventType event_type{};
+    if (SUCCEEDED(result)) result = new_stream_event->GetType(&event_type);
+    if (FAILED(result) || event_type != MENewStream) {
+      if (new_stream_event) new_stream_event->Release();
+      std::cerr << "First Start did not queue MENewStream.\n";
+      break;
+    }
+    PROPVARIANT stream_value;
+    PropVariantInit(&stream_value);
+    result = new_stream_event->GetValue(&stream_value);
+    new_stream_event->Release();
+    if (SUCCEEDED(result) && stream_value.vt == VT_UNKNOWN) {
+      result = stream_value.punkVal->QueryInterface(
+          __uuidof(IMFMediaStream), reinterpret_cast<void**>(&stream));
+    } else if (SUCCEEDED(result)) {
+      result = E_NOINTERFACE;
+    }
+    PropVariantClear(&stream_value);
+    LONGLONG source_started_time = 0;
+    if (FAILED(result) || !stream ||
+        !supports<IMFMediaEventGenerator>(stream, "Stream IMFMediaEventGenerator") ||
+        !supports<IMFMediaStream>(stream, "IMFMediaStream") ||
+        !supports<IMFMediaStream2>(stream, "IMFMediaStream2") ||
+        !expect_event_value_type(source, MESourceStarted, VT_I8, "First source start",
+                                &source_started_time) ||
+        !expect_event_value_type(stream, MEStreamStarted, VT_EMPTY, "First stream start")) {
+      break;
+    }
+    result = stream->QueryInterface(
+        __uuidof(IMFMediaStream2), reinterpret_cast<void**>(&stream2));
+    MF_STREAM_STATE stream_state = MF_STREAM_STATE_STOPPED;
+    if (FAILED(result) || !stream2 ||
+        FAILED(stream2->GetStreamState(&stream_state)) ||
+        stream_state != MF_STREAM_STATE_RUNNING) {
+      std::cerr << "Stream did not expose IMFMediaStream2 in the running state.\n";
+      break;
+    }
+    if (FAILED(stream2->SetStreamState(MF_STREAM_STATE_RUNNING)) ||
+        !expect_no_event(stream, "Repeated RUNNING transition") ||
+        !expect_no_event(source, "Repeated RUNNING transition")) {
+      std::cerr << "Repeated RUNNING transition emitted a duplicate start event.\n";
+      break;
+    }
+
+    MF_STREAM_STATE before_pause_state = MF_STREAM_STATE_STOPPED;
+    if (FAILED(stream2->GetStreamState(&before_pause_state))) break;
+    result = source->Pause();
+    MF_STREAM_STATE after_pause_state = MF_STREAM_STATE_STOPPED;
+    if (result != MF_E_INVALID_STATE_TRANSITION ||
+        FAILED(stream2->GetStreamState(&after_pause_state)) ||
+        after_pause_state != before_pause_state ||
+        !expect_no_event(source, "Rejected source Pause") ||
+        !expect_no_event(stream, "Rejected source Pause")) {
+      std::cerr << "Source Pause did not reject without emitting pause events.\n";
+      break;
+    }
+    CountedToken token;
+    if (FAILED(token.Initialize())) {
+      std::cerr << "Could not initialize a marshaled sample token.\n";
+      break;
+    }
+    result = stream2->SetStreamState(MF_STREAM_STATE_PAUSED);
+    if (FAILED(result) ||
+        FAILED(stream2->GetStreamState(&stream_state)) ||
+        stream_state != MF_STREAM_STATE_PAUSED ||
+        !expect_no_event(stream, "Stream PAUSED transition") ||
+        !expect_no_event(source, "Stream PAUSED transition")) {
+      std::cerr << "IMFMediaStream2 PAUSED transition failed or emitted an event.\n";
+      break;
+    }
+    result = stream->RequestSample(&token);
+    if (result != MF_E_INVALIDREQUEST || token.reference_count() != 1) {
+      std::cerr << "Paused RequestSample did not return MF_E_INVALIDREQUEST.\n";
+      break;
+    }
+    result = stream2->SetStreamState(MF_STREAM_STATE_RUNNING);
+    if (FAILED(result) ||
+        FAILED(stream2->GetStreamState(&stream_state)) ||
+        stream_state != MF_STREAM_STATE_RUNNING ||
+        !expect_no_event(stream, "Stream RUNNING transition") ||
+        !expect_no_event(source, "Stream RUNNING transition")) {
+      std::cerr << "IMFMediaStream2 resume failed or emitted a duplicate start event.\n";
+      break;
+    }
+    LONGLONG first_timestamp = 0;
+    LONGLONG first_duration = 0;
+#ifdef MINIMIX_VCAM_TEST_HOOKS
+    if (FAILED(set_worker_paused(TRUE)) ||
+        !request_sample_while_worker_paused(
+            stream, &token, set_worker_paused, wait_for_worker, &result)) {
+      std::cerr << "RequestSample waited for its paused worker to start.\n";
+      break;
+    }
+    if (wait_for_request_releases(1, 5000) != WAIT_OBJECT_0) {
+      std::cerr << "The accepted sample request did not complete.\n";
+      break;
+    }
+#else
+    result = stream->RequestSample(&token);
+#endif
+    if (FAILED(result) ||
+        !expect_color_bars_sample(stream, &token, &first_timestamp, &first_duration) ||
+        first_timestamp < source_started_time || first_duration != 333333) {
+      std::cerr << "A running stream did not deliver its requested sample.\n";
+      break;
+    }
+#ifdef MINIMIX_VCAM_TEST_HOOKS
+    std::uint64_t registrations = 0, revocations = 0, releases = 0;
+    if (wait_for_request_releases(1, 5000) != WAIT_OBJECT_0 ||
+        FAILED(get_request_counters(&registrations, &revocations, &releases)) ||
+        registrations != 1 || revocations != 1 || releases != 1) {
+      std::cerr << "Successful request did not release its GIT token exactly once.\n";
+      break;
+    }
+#endif
+    for (int attempt = 0; attempt < 100 && token.reference_count() != 1; ++attempt) {
+      Sleep(10);
+    }
+    LONGLONG second_timestamp = 0;
+    LONGLONG second_duration = 0;
+    result = stream->RequestSample(&token);
+#ifdef MINIMIX_VCAM_TEST_HOOKS
+    if (SUCCEEDED(result) &&
+        wait_for_request_releases(2, 5000) != WAIT_OBJECT_0) {
+      result = E_FAIL;
+    }
+#endif
+    if (FAILED(result) ||
+        !expect_color_bars_sample(stream, &token, &second_timestamp, &second_duration) ||
+        second_timestamp <= first_timestamp ||
+        second_timestamp < source_started_time || second_duration != 333333) {
+      std::cerr << "Sample timestamps were not strictly increasing.\n";
+      break;
+    }
+    for (int attempt = 0; attempt < 100 && token.reference_count() != 1; ++attempt) {
+      Sleep(10);
+    }
+    if (token.reference_count() != 1) {
+      std::cerr << "Accepted sample requests retained the token after delivery.\n";
+      break;
+    }
+    result = stream2->SetStreamState(MF_STREAM_STATE_STOPPED);
+    if (FAILED(result) ||
+        FAILED(stream2->GetStreamState(&stream_state)) ||
+        stream_state != MF_STREAM_STATE_STOPPED ||
+        !expect_no_event(stream, "Stream STOPPED transition") ||
+        !expect_no_event(source, "Stream STOPPED transition") ||
+        stream->RequestSample(&token) != MF_E_INVALIDREQUEST ||
+        token.reference_count() != 1) {
+      std::cerr << "IMFMediaStream2 STOPPED transition failed or emitted an event.\n";
+      break;
+    }
+    LONGLONG source_stopped_time = 0;
+    result = source->Stop();
+    if (FAILED(result) ||
+        !expect_event_value_type(stream, MEStreamStopped, VT_EMPTY, "Stream stop") ||
+        !expect_event_value_type(source, MESourceStopped, VT_I8, "Source stop",
+                                &source_stopped_time) ||
+        source_stopped_time < second_timestamp ||
+        FAILED(stream2->GetStreamState(&stream_state)) ||
+        stream_state != MF_STREAM_STATE_STOPPED ||
+        stream->RequestSample(&token) != MF_E_INVALIDREQUEST ||
+        token.reference_count() != 1) {
+      std::cerr << "Stopped stream state or RequestSample behavior was incorrect.\n";
+      break;
+    }
+    if (source->Stop() != MF_E_INVALID_STATE_TRANSITION ||
+        !expect_no_event(stream, "Repeated source Stop") ||
+        !expect_no_event(source, "Repeated source Stop")) {
+      std::cerr << "Repeated source Stop emitted duplicate stop events.\n";
+      break;
+    }
+    result = stream2->SetStreamState(MF_STREAM_STATE_STOPPED);
+    if (FAILED(result) ||
+        !expect_no_event(stream, "Repeated STOPPED transition") ||
+        !expect_no_event(source, "Repeated STOPPED transition")) {
+      std::cerr << "Repeated STOPPED transition emitted a duplicate event.\n";
+      break;
+    }
+    if (stream2->SetStreamState(MF_STREAM_STATE_PAUSED) !=
+        MF_E_INVALID_STATE_TRANSITION) {
+      std::cerr << "PAUSED transition from STOPPED was incorrectly accepted.\n";
+      break;
+    }
+
+    IMFPresentationDescriptor* after_stop = nullptr;
+    result = source->CreatePresentationDescriptor(&after_stop);
+    BOOL after_stop_selected = TRUE;
+    IMFStreamDescriptor* after_stop_stream = nullptr;
+    if (SUCCEEDED(result)) {
+      result = after_stop->GetStreamDescriptorByIndex(
+          0, &after_stop_selected, &after_stop_stream);
+    }
+    if (after_stop_stream) after_stop_stream->Release();
+    if (after_stop) after_stop->Release();
+    if (FAILED(result) || after_stop_selected) {
+      std::cerr << "CreatePresentationDescriptor did not retain Stop deselection.\n";
+      break;
+    }
+
+    result = source->Start(presentation, &current_time, &start_position);
+    if (FAILED(result) ||
+        !expect_stream_announcement(source, MENewStream, stream,
+                                    "Start after Stop") ||
+        !expect_event_value_type(stream, MEStreamStarted, VT_EMPTY,
+                                 "Start after Stop") ||
+        !expect_event_value_type(source, MESourceStarted, VT_I8,
+                                 "Start after Stop")) {
+      std::cerr << "Start after Stop did not announce the reselected stream in order.\n";
+      break;
+    }
+    result = source->Start(presentation, &current_time, &start_position);
+    if (FAILED(result) ||
+        !expect_stream_announcement(source, MEUpdatedStream, stream,
+                                    "Repeated selected Start") ||
+        !expect_event_value_type(stream, MEStreamStarted, VT_EMPTY,
+                                 "Repeated selected Start") ||
+        !expect_event_value_type(source, MESourceStarted, VT_I8,
+                                 "Repeated selected Start")) {
+      std::cerr << "A previously selected stream did not use MEUpdatedStream.\n";
+      break;
+    }
+
+    IMFPresentationDescriptor* deselected_presentation = nullptr;
+    result = source->CreatePresentationDescriptor(&deselected_presentation);
+    if (SUCCEEDED(result)) result = deselected_presentation->DeselectStream(0);
+    if (SUCCEEDED(result)) {
+      result = source->Start(
+          deselected_presentation, &current_time, &start_position);
+    }
+    if (deselected_presentation) deselected_presentation->Release();
+    if (FAILED(result) ||
+        !expect_no_event(stream, "Start with deselected stream") ||
+        !expect_event_value_type(source, MESourceStarted, VT_I8,
+                                 "Start with deselected stream") ||
+        FAILED(stream2->GetStreamState(&stream_state)) ||
+        stream_state != MF_STREAM_STATE_STOPPED) {
+      std::cerr << "Deselecting a running stream did not stop it correctly.\n";
+      break;
+    }
+    if (FAILED(stream2->SetStreamState(MF_STREAM_STATE_RUNNING)) ||
+        !expect_no_event(stream, "Independent RUNNING transition") ||
+        !expect_no_event(source, "Independent RUNNING transition")) {
+      std::cerr << "Independent stream RUNNING transition unexpectedly emitted events.\n";
+      break;
+    }
+    result = source->Stop();
+    if (FAILED(result) ||
+        !expect_event_value_type(stream, MEStreamStopped, VT_EMPTY,
+                                 "Stop independently running stream") ||
+        !expect_event_value_type(source, MESourceStopped, VT_I8,
+                                 "Stop independently running stream") ||
+        FAILED(stream2->GetStreamState(&stream_state)) ||
+        stream_state != MF_STREAM_STATE_STOPPED) {
+      std::cerr << "Source Stop did not stop an independently running stream.\n";
+      break;
+    }
+
+    IMFPresentationDescriptor* next_start_presentation = nullptr;
+    result = source->CreatePresentationDescriptor(&next_start_presentation);
+    BOOL next_start_selected = TRUE;
+    IMFStreamDescriptor* next_start_stream = nullptr;
+    if (SUCCEEDED(result)) {
+      result = next_start_presentation->GetStreamDescriptorByIndex(
+          0, &next_start_selected, &next_start_stream);
+    }
+    if (next_start_stream) next_start_stream->Release();
+    if (SUCCEEDED(result) && !next_start_selected) {
+      result = next_start_presentation->SelectStream(0);
+    } else if (SUCCEEDED(result)) {
+      result = E_UNEXPECTED;
+    }
+    if (SUCCEEDED(result)) {
+      result = source->Start(
+          next_start_presentation, &current_time, &start_position);
+    }
+    if (FAILED(result) ||
+        !expect_stream_announcement(source, MENewStream, stream,
+                                    "Next Start after Stop") ||
+        !expect_event_value_type(stream, MEStreamStarted, VT_EMPTY,
+                                 "Next Start after Stop") ||
+        !expect_event_value_type(source, MESourceStarted, VT_I8,
+                                 "Next Start after Stop")) {
+      if (next_start_presentation) next_start_presentation->Release();
+      std::cerr << "Next Start did not use the caller's selection after Stop.\n";
+      break;
+    }
+    if (next_start_presentation) next_start_presentation->Release();
+
+#ifdef MINIMIX_VCAM_TEST_HOOKS
+    {
+      std::uint64_t registrations = 0, revocations = 0, releases = 0;
+      if (FAILED(get_request_counters(&registrations, &revocations, &releases))) break;
+      fail_next_registration();
+      result = stream->RequestSample(&token);
+      std::uint64_t after_registrations = 0, after_revocations = 0, after_releases = 0;
+      if (result != E_FAIL || token.reference_count() != 1 ||
+          FAILED(get_request_counters(&after_registrations, &after_revocations,
+                                     &after_releases)) ||
+          after_registrations != registrations ||
+          after_revocations != revocations ||
+          after_releases != releases + 1) {
+        std::cerr << "GIT registration failure did not clean up exactly once.\n";
+        break;
+      }
+
+      fail_next_submission();
+      result = stream->RequestSample(&token);
+      if (result != E_FAIL || token.reference_count() != 1 ||
+          wait_for_request_releases(releases + 2, 5000) != WAIT_OBJECT_0 ||
+          FAILED(get_request_counters(&after_registrations, &after_revocations,
+                                     &after_releases)) ||
+          after_registrations != registrations + 1 ||
+          after_revocations != revocations + 1 ||
+          after_releases != releases + 2) {
+        std::cerr << "Submission failure did not revoke and release exactly once.\n";
+        break;
+      }
+
+      fail_next_retrieval();
+      result = stream->RequestSample(&token);
+      if (FAILED(result) ||
+          wait_for_request_releases(releases + 3, 5000) != WAIT_OBJECT_0 ||
+          token.reference_count() != 1 ||
+          FAILED(get_request_counters(&after_registrations, &after_revocations,
+                                     &after_releases)) ||
+          after_registrations != registrations + 2 ||
+          after_revocations != revocations + 2 ||
+          after_releases != releases + 3 ||
+          !expect_event_value_type(source, MEError, VT_EMPTY,
+                                   "Asynchronous token retrieval failure")) {
+        std::cerr << "Worker retrieval failure did not report and clean up exactly once.\n";
+        break;
+      }
+    }
+
+    {
+      std::uint64_t registrations = 0, revocations = 0, releases = 0;
+      if (FAILED(get_request_counters(&registrations, &revocations, &releases)) ||
+          FAILED(set_worker_paused(TRUE)) ||
+          FAILED(stream->RequestSample(&token)) ||
+          wait_for_worker(5000) != WAIT_OBJECT_0) {
+        set_worker_paused(FALSE);
+        std::cerr << "Could not hold a queued request for Stop-race coverage.\n";
+        break;
+      }
+      result = source->Stop();
+      const bool stop_events_ok = SUCCEEDED(result) &&
+          expect_event_value_type(stream, MEStreamStopped, VT_EMPTY,
+                                  "Stop with request pending") &&
+          expect_event_value_type(source, MESourceStopped, VT_I8,
+                                  "Stop with request pending");
+      set_worker_paused(FALSE);
+      if (!stop_events_ok ||
+          wait_for_request_releases(releases + 1, 5000) != WAIT_OBJECT_0 ||
+          token.reference_count() != 1 ||
+          !expect_no_event(stream, "Stale request after Stop")) {
+        std::cerr << "Stop did not invalidate an in-flight sample request.\n";
+        break;
+      }
+    }
+
+    {
+      IMFPresentationDescriptor* shutdown_presentation = nullptr;
+      result = source->CreatePresentationDescriptor(&shutdown_presentation);
+      if (SUCCEEDED(result)) result = shutdown_presentation->SelectStream(0);
+      if (SUCCEEDED(result)) {
+        result = source->Start(
+            shutdown_presentation, &current_time, &start_position);
+      }
+      if (shutdown_presentation) shutdown_presentation->Release();
+      if (FAILED(result) ||
+          !expect_stream_announcement(source, MENewStream, stream,
+                                      "Start before Shutdown race") ||
+          !expect_event_value_type(stream, MEStreamStarted, VT_EMPTY,
+                                   "Start before Shutdown race") ||
+          !expect_event_value_type(source, MESourceStarted, VT_I8,
+                                   "Start before Shutdown race")) {
+        std::cerr << "Could not prepare Shutdown-race coverage.\n";
+        break;
+      }
+
+      std::uint64_t registrations = 0, revocations = 0, releases = 0;
+      if (FAILED(get_request_counters(&registrations, &revocations, &releases)) ||
+          FAILED(set_worker_paused(TRUE)) ||
+          FAILED(stream->RequestSample(&token)) ||
+          wait_for_worker(5000) != WAIT_OBJECT_0) {
+        set_worker_paused(FALSE);
+        std::cerr << "Could not hold a queued request for Shutdown-race coverage.\n";
+        break;
+      }
+      result = source->Shutdown();
+      set_worker_paused(FALSE);
+      IMFMediaEvent* shutdown_event = nullptr;
+      const HRESULT shutdown_event_hr =
+          stream->GetEvent(MF_EVENT_FLAG_NO_WAIT, &shutdown_event);
+      if (shutdown_event) shutdown_event->Release();
+      if (FAILED(result) ||
+          wait_for_request_releases(releases + 1, 5000) != WAIT_OBJECT_0 ||
+          token.reference_count() != 1 ||
+          shutdown_event_hr != MF_E_SHUTDOWN) {
+        std::cerr << "Shutdown did not safely invalidate and release the pending request.\n";
+        break;
+      }
+    }
+#endif
+
+    IMFSampleAllocatorControl* allocator_control = nullptr;
+    result = source->QueryInterface(
+        __uuidof(IMFSampleAllocatorControl), reinterpret_cast<void**>(&allocator_control));
+    if (FAILED(result)) break;
+    DWORD input_stream_id = 0;
+    MFSampleAllocatorUsage usage{};
+    result = allocator_control->GetAllocatorUsage(0, &input_stream_id, &usage);
+    allocator_control->Release();
+    if (FAILED(result) || usage != MFSampleAllocatorUsage_UsesCustomAllocator) {
+      std::cerr << "Unexpected sample allocator configuration.\n";
+      break;
+    }
+
+    passed = true;
+  } while (false);
+
+  if (activate) activate->ShutdownObject();
+  if (source && source->Pause() != MF_E_SHUTDOWN) {
+    std::cerr << "A shut-down source did not return MF_E_SHUTDOWN from Pause.\n";
+    passed = false;
+  }
+  if (stream && stream->RequestSample(nullptr) != MF_E_SHUTDOWN) {
+    std::cerr << "A retained stream did not reject requests after source shutdown.\n";
+    passed = false;
+  }
+  if (stream2) {
+    MF_STREAM_STATE stream_state = MF_STREAM_STATE_RUNNING;
+    if (stream2->GetStreamState(&stream_state) != MF_E_SHUTDOWN) {
+      std::cerr << "A retained IMFMediaStream2 did not report shutdown.\n";
+      passed = false;
+    }
+  }
+  if (stream2) stream2->Release();
+  if (stream) stream->Release();
+  if (presentation) presentation->Release();
+  if (source) source->Release();
+  if (activate) activate->Release();
+  if (factory) factory->Release();
+  if (module) FreeLibrary(module);
+  MFShutdown();
+  CoUninitialize();
+
+  if (passed) std::cout << "Virtual-camera COM activation interfaces passed.\n";
+  return passed ? 0 : 1;
+}
